@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["bqredis/*"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+local_scheme = "no-local-version"
+
+[tool.hatch.metadata.hooks.vcs.urls]
+source_archive = "https://github.com/DelfinaCare/bqredis/archive/{commit_hash}.zip"
+
+[project]
+name = "bqredis"
+dynamic = ["version"]
+authors = [
+  { name="Ali.Ebrahim", email="ali@delfina.com" },
+]
+description = "A Redis-backed cache for BigQuery"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "redis >= 5.2.1",
+  "pyarrow >= 18.1.0",
+  "google-cloud-bigquery >= 3.35.1",
+  "google-cloud-bigquery-storage >= 2.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy >=1.11.2",
+  "fakeredis >= 2.30.3",
+  "pyarrow-stubs >=20.0.0.20250716",
+  "pytest >= 8.4.1"
+]
+
+[project.urls]
+Homepage = "https://github.com/DelfinaCare/bqredis"
+Issues = "https://github.com/DelfinaCare/bqredis/issues"
+Repository = "https://github.com/DelfinaCare/bqredis.git"
+
+[tool.ruff.lint]
+extend-select = ["I"]

@@ -34,7 +34,10 @@ class BQRedis:
     """A class to cache BigQuery results in Redis.
 
     This should be instantiated as a singleton, as it maintains a
-    ThreadPoolExecutor.
+    ThreadPoolExecutor. This allows concurrent query execution and caching
+    across multiple instances which share a redis connection. Additionally,
+    each instance maintains at most one inflight connection per query to
+    BigQuery.
     """
 
     def __init__(
@@ -110,7 +113,7 @@ class BQRedis:
 
     def _execute_query_to_bytes(self, query: str, key: str) -> _QueryResult:
         query_job: bigquery.QueryJob = self.bigquery_client.query(query)
-        while not query_job.done():
+        while not query_job.done(reload=False):
             query_job.reload()
         # WHAT ARE YOU DOING? YOU ARE MODIFYING THE DICT WITHOUT THE LOCK????
         # Whoa there - you are right that this is strange - but let me clarify.
@@ -217,7 +220,9 @@ class BQRedis:
         return self.executor.submit(self.query_sync, query, max_age)
 
     def clear_cache_sync(self) -> None:
-        """Clear the Redis cache synchronously."""
+        """Clear the cache synchronously."""
+        with self.inflight_requests_lock:
+            self.inflight_requests.clear()
         logger.debug("Beginning cache clear")
         key_count = 0
         for key in self.redis_client.scan_iter(self.redis_key_prefix + "*"):
@@ -226,5 +231,5 @@ class BQRedis:
         logger.info("Cleared %d keys from Redis cache", key_count)
 
     def clear_cache(self) -> concurrent.futures.Future[None]:
-        """Clear the Redis cache in the background."""
+        """Clear the cache in the background."""
         return self.executor.submit(self.clear_cache_sync)

@@ -52,6 +52,19 @@ class TestBQRedisIntegration(unittest.TestCase):
         self.assertEqual(second_result, self.expected_result)
         self.assert_in_cache(self.query_hash)
 
+    def test_execution_end_to_end_empty_result(self):
+        query_str = "SELECT alpha_2_code FROM `bigquery-public-data.country_codes.country_codes` WHERE alpha_2_code = 'ZZ'"
+        query_hash = hashlib.sha256(query_str.encode()).hexdigest()
+        self.assert_not_in_cache(query_hash)
+        first_result = self.cache.query_sync(query_str)
+        self.assertEqual(len(first_result), 0)
+        schema = self.redis.get(self.cache.redis_key_prefix + query_hash + ":schema")
+        self.assertEqual(schema, self.expected_bin_schema)
+        second_result = self.cache.query_sync(query_str)
+        self.assertEqual(len(second_result), 0)
+        schema = self.redis.get(self.cache.redis_key_prefix + query_hash + ":schema")
+        self.assertEqual(schema, self.expected_bin_schema)
+
     def test_background_execution(self):
         self.assert_not_in_cache(self.query_hash)
         self.cache.submit_background_refresh(self.query_str).result()

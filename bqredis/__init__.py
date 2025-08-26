@@ -80,9 +80,7 @@ class BQRedis:
                 inflight_request = self.inflight_requests[key]
             except KeyError:
                 logger.debug("Dispatching new inflight request for key: %s", key)
-                new_request = self.executor.submit(
-                    self._execute_query_to_bytes, query, key
-                )
+                new_request = self.executor.submit(self._execute_query, query, key)
                 self.inflight_requests[key] = new_request
                 new_request.add_done_callback(self._cache_put)
                 return new_request
@@ -108,7 +106,21 @@ class BQRedis:
         pipeline.execute()
         logger.debug("Cached query result for key: %s", query_result.key)
 
-    def _execute_query_to_bytes(self, query: str, key: str) -> _QueryResult:
+    def _execute_query(self, query: str, key: str) -> _QueryResult:
+        result = self._read_bigquery_bytes(query, key)
+        schema = pyarrow.ipc.read_schema(
+            pyarrow.BufferReader(result.serialized_schema).read_buffer()
+        )
+        buffer = result.serialized_data.getbuffer()
+        if buffer.nbytes == 0:
+            records = pyarrow.RecordBatch.from_pylist([], schema)
+        else:
+            records = pyarrow.ipc.read_record_batch(buffer, schema)
+        result.records = self.convert_arrow_to_output_format(records)
+        return result
+
+    # This is its own function for easy mocking.
+    def _read_bigquery_bytes(self, query: str, key: str) -> _QueryResult:
         query_job: bigquery.QueryJob = self.bigquery_client.query(query)
         while not query_job.done():
             query_job.reload()
@@ -155,17 +167,14 @@ class BQRedis:
                 result.serialized_data.write(
                     page.arrow_record_batch.serialized_record_batch
                 )
-        schema = pyarrow.ipc.read_schema(
-            pyarrow.BufferReader(result.serialized_schema).read_buffer()
+        logger.debug(
+            "Query for key %s returned %d pages in %d streams with a total of %d bytes",
+            key,
+            page_count,
+            len(session.streams),
+            result.serialized_data.getbuffer().nbytes,
         )
-        result.records = self.convert_arrow_to_output_format(
-            pyarrow.ipc.read_record_batch(result.serialized_data.getbuffer(), schema)
-        )
-        logger.debug("Read %d pages from %d streams", page_count, len(session.streams))
         return result
-
-    def _mark_no_longer_inflight(self, key: str) -> None:
-        pass
 
     def _background_refresh_cache(self, query: str, key: str) -> None:
         if self.redis_client.get(key + ":background_refresh"):
@@ -196,7 +205,7 @@ class BQRedis:
         cached_schema: bytes | None
         ttl: int | None
         cached_data, cached_schema, ttl = pipeline.execute()
-        if cached_data and cached_schema and ttl is not None:
+        if cached_schema is not None and ttl is not None:
             result_age = self.redis_cache_ttl - ttl
             if max_age is None or (max_age != 0 and result_age < max_age):
                 if result_age > self.redis_background_refresh_ttl:
@@ -205,7 +214,10 @@ class BQRedis:
                 schema = pyarrow.ipc.read_schema(
                     pyarrow.BufferReader(cached_schema).read_buffer()
                 )
-                records = pyarrow.ipc.read_record_batch(cached_data, schema)
+                if len(cached_data) == 0:
+                    records = pyarrow.RecordBatch.from_pylist([], schema)
+                else:
+                    records = pyarrow.ipc.read_record_batch(cached_data, schema)
                 return self.convert_arrow_to_output_format(records)
         logger.debug("Requesting new execution for query key %s", key)
         return self._submit_query(query, key).result().records

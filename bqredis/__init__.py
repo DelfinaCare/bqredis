@@ -196,7 +196,9 @@ class BQRedis:
         key = self.redis_key_prefix + query_hash
         return self.executor.submit(self._background_refresh_cache, query, key)
 
-    def _check_redis_cache(self, query: str, key: str, max_age: int | None) -> pyarrow.RecordBatch | None:
+    def _check_redis_cache(
+        self, query: str, key: str, max_age: int | None
+    ) -> pyarrow.RecordBatch | None:
         pipeline = self.redis_client.pipeline()
         pipeline.get(key + ":data")
         pipeline.get(key + ":schema")

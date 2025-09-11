@@ -196,10 +196,9 @@ class BQRedis:
         key = self.redis_key_prefix + query_hash
         return self.executor.submit(self._background_refresh_cache, query, key)
 
-    def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.RecordBatch:
-        """Execute a bigquery allowing cached results."""
-        query_hash = hashlib.sha256(query.encode()).hexdigest()
-        key = self.redis_key_prefix + query_hash
+    def _check_redis_cache(
+        self, query: str, key: str, max_age: int | None
+    ) -> pyarrow.RecordBatch | None:
         pipeline = self.redis_client.pipeline()
         pipeline.get(key + ":data")
         pipeline.get(key + ":schema")
@@ -208,20 +207,30 @@ class BQRedis:
         cached_schema: bytes | None
         ttl: int | None
         cached_data, cached_schema, ttl = pipeline.execute()
-        if cached_schema is not None and ttl is not None:
-            result_age = self.redis_cache_ttl - ttl
-            if max_age is None or (max_age != 0 and result_age < max_age):
-                if result_age > self.redis_background_refresh_ttl:
-                    self.executor.submit(self._background_refresh_cache, query, key)
-                logger.debug("Using cached result for query key: %s", key)
-                schema = pyarrow.ipc.read_schema(
-                    pyarrow.BufferReader(cached_schema).read_buffer()
-                )
-                if len(cached_data) == 0:
-                    records = pyarrow.RecordBatch.from_pylist([], schema)
-                else:
-                    records = pyarrow.ipc.read_record_batch(cached_data, schema)
-                return self.convert_arrow_to_output_format(records)
+        if cached_schema is None or ttl is None:
+            return None
+        result_age = self.redis_cache_ttl - ttl
+        if max_age is not None and result_age > max_age:
+            return None
+        if max_age == 0:
+            return None
+        if result_age > self.redis_background_refresh_ttl:
+            self.executor.submit(self._background_refresh_cache, query, key)
+        logger.debug("Using cached result for query key: %s", key)
+        schema = pyarrow.ipc.read_schema(
+            pyarrow.BufferReader(cached_schema).read_buffer()
+        )
+        if len(cached_data) == 0:
+            return pyarrow.RecordBatch.from_pylist([], schema)
+        return pyarrow.ipc.read_record_batch(cached_data, schema)
+
+    def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.RecordBatch:
+        """Execute a bigquery allowing cached results."""
+        query_hash = hashlib.sha256(query.encode()).hexdigest()
+        key = self.redis_key_prefix + query_hash
+        cached_records = self._check_redis_cache(query, key, max_age)
+        if cached_records is not None:
+            return self.convert_arrow_to_output_format(cached_records)
         logger.debug("Requesting new execution for query key %s", key)
         return self._submit_query(query, key).result().records
 

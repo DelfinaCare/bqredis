@@ -1,3 +1,4 @@
+import concurrent.futures
 import hashlib
 import io
 import unittest.mock
@@ -6,6 +7,14 @@ import fakeredis
 import pyarrow as pa
 
 import bqredis
+
+
+def _query_result(key: str, result: pa.RecordBatch) -> bqredis._QueryResult:
+    return bqredis._QueryResult(
+        key=key,
+        serialized_schema=result.schema.serialize().to_pybytes(),
+        serialized_data=io.BytesIO(result.serialize().to_pybytes()),
+    )
 
 
 class TestBQRedis(unittest.TestCase):
@@ -21,14 +30,60 @@ class TestBQRedis(unittest.TestCase):
     def mock_execute_query_to_bytes(
         self, key: str, expected_result: pa.RecordBatch
     ) -> unittest.mock.MagicMock:
-        mock_query_result = bqredis._QueryResult(
-            key=key,
-            serialized_schema=expected_result.schema.serialize().to_pybytes(),
-            serialized_data=io.BytesIO(expected_result.serialize().to_pybytes()),
-        )
+        mock_query_result = _query_result(key, expected_result)
         return unittest.mock.patch.object(  # type: ignore
             self.cache, "_read_bigquery_bytes", return_value=mock_query_result
         )
+
+    def test_check_cache(self):
+        key = self.cache.redis_key_prefix + self.query_hash
+        records = pa.RecordBatch.from_arrays(
+            [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
+        )
+        # With no value set, should not find anything
+        with unittest.mock.patch.object(self.cache.executor, "submit") as mock_submit:
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, None), None
+            )
+            self.assertEqual(mock_submit.call_count, 0)
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, 10), None
+            )
+            self.assertEqual(mock_submit.call_count, 0)
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, 0), None
+            )
+            self.assertEqual(mock_submit.call_count, 0)
+        ft = concurrent.futures.Future()
+        ft.set_result(_query_result(key, records))
+        self.cache._cache_put(ft)
+        with unittest.mock.patch.object(self.cache.executor, "submit") as mock_submit:
+            # A fresh result should get returned, with no cache refresh
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, None), records
+            )
+            self.assertEqual(mock_submit.call_count, 0)
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, 1), records
+            )
+            self.assertEqual(mock_submit.call_count, 0)
+
+            # Data is close to expiring - only 10 seconds left. Its age is now mocked as 3600 - 10
+            self.cache.redis_client.expire(key + ":data", 10)
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, None), records
+            )
+            self.assertEqual(mock_submit.call_count, 1)
+            # Requesting a fresh result does not find anything, and does not schedule a background
+            # refresh because the main execution will be used to fill the cache.
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, 1), None
+            )
+            self.assertEqual(mock_submit.call_count, 1)
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, 0), None
+            )
+            self.assertEqual(mock_submit.call_count, 1)
 
     def test_execution_called_only_once_with_cache(self):
         key = self.cache.redis_key_prefix + self.query_hash

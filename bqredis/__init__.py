@@ -62,6 +62,11 @@ class BQRedis:
         self.inflight_requests: weakref.WeakValueDictionary[
             str, concurrent.futures.Future[_QueryResult]
         ] = weakref.WeakValueDictionary()
+        # This lock exists so we can avoid launching multiple inflight requests for the same
+        # query while another parallel request is actively queuing. Because this is a weakref
+        # dictionary, the lock does not help protect against deletions, so accessing values
+        # from the inflight_requests dict need to be atomic (e.g. a direct get, or a try/except)
+        # instead of first checking for existence and then accessing.
         self.inflight_requests_lock = threading.Lock()
 
     def convert_arrow_to_output_format(
@@ -111,8 +116,20 @@ class BQRedis:
         pipeline.execute()
         logger.debug("Cached query result for key: %s", query_result.key)
 
+    def _mark_inflight_completed(self, key: str):
+        # WHAT ARE YOU DOING? YOU ARE MODIFYING THE DICT WITHOUT THE LOCK????
+        # Whoa there - you are right that this is strange - but let me clarify.
+        # This is a weakref dictionary, so entries can already be garbage
+        # collected. We really need the lock to make sure only one thread
+        # at a time tries to create a new inflight request to prevent
+        # duplication which could easily saturate all of our worker threads.
+        self.inflight_requests.pop(key, None)
+
     def _execute_query(self, query: str, key: str) -> _QueryResult:
-        result = self._read_bigquery_bytes(query, key)
+        try:
+            result = self._read_bigquery_bytes(query, key)
+        finally:
+            self._mark_inflight_completed(key)
         schema = pyarrow.ipc.read_schema(
             pyarrow.BufferReader(result.serialized_schema).read_buffer()
         )
@@ -129,13 +146,7 @@ class BQRedis:
         query_job: bigquery.QueryJob = self.bigquery_client.query(query)
         while not query_job.done(reload=False):
             query_job.reload()
-        # WHAT ARE YOU DOING? YOU ARE MODIFYING THE DICT WITHOUT THE LOCK????
-        # Whoa there - you are right that this is strange - but let me clarify.
-        # This is a weakref dictionary, so entries can already be garbage
-        # collected. We really need the lock to make sure only one thread
-        # at a time tries to create a new inflight request to prevent
-        # duplication which could easily saturate all of our worker threads.
-        self.inflight_requests.pop(key, None)
+        self._mark_inflight_completed(key)
         if exc := query_job.exception():
             deleted_count = 0
             try:
@@ -145,8 +156,8 @@ class BQRedis:
                     logger.info(
                         "Cleared background refresh marker on failure for key: %s", key
                     )
-                logger.error("BigQuery job failed for key: %s, error: %s", key, exc)
-                raise exc
+            logger.error("BigQuery job failed for key: %s, error: %s", key, exc)
+            raise exc
         read_request = bq_storage.types.ReadSession(
             table=query_job.destination.to_bqstorage(),
             data_format=bq_storage.types.DataFormat.ARROW,
@@ -244,8 +255,7 @@ class BQRedis:
 
     def clear_cache_sync(self) -> None:
         """Clear the cache synchronously."""
-        with self.inflight_requests_lock:
-            self.inflight_requests.clear()
+        self.inflight_requests.clear()
         logger.debug("Beginning cache clear")
         key_count = 0
         for key in self.redis_client.scan_iter(self.redis_key_prefix + "*"):

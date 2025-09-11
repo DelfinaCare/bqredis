@@ -17,22 +17,31 @@ def _query_result(key: str, result: pa.RecordBatch) -> bqredis._QueryResult:
     )
 
 
+class MockException(Exception):
+    pass
+
+
 class TestBQRedis(unittest.TestCase):
     def setUp(self):
         super().setUp()
+        self.executor = concurrent.futures.ThreadPoolExecutor()
         self.redis = fakeredis.FakeStrictRedis()
         self.cache = bqredis.BQRedis(
-            self.redis, bigquery_client=object(), bigquery_storage_client=object()
+            self.redis,
+            bigquery_client=object(),
+            bigquery_storage_client=object(),
+            executor=self.executor,
         )
         self.query_str = "SELECT foo FROM bar;"
         self.query_hash = hashlib.sha256(self.query_str.encode()).hexdigest()
 
-    def mock_execute_query_to_bytes(
-        self, key: str, expected_result: pa.RecordBatch
-    ) -> unittest.mock.MagicMock:
-        mock_query_result = _query_result(key, expected_result)
+    def tearDown(self):
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        return super().tearDown()
+
+    def mock_execute_query_to_bytes(self) -> unittest.mock.MagicMock:
         return unittest.mock.patch.object(  # type: ignore
-            self.cache, "_read_bigquery_bytes", return_value=mock_query_result
+            self.cache, "_read_bigquery_bytes"
         )
 
     def test_check_cache(self):
@@ -90,7 +99,8 @@ class TestBQRedis(unittest.TestCase):
         expected_result = pa.RecordBatch.from_arrays(
             [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
         )
-        with self.mock_execute_query_to_bytes(key, expected_result) as execution_mock:
+        with self.mock_execute_query_to_bytes() as execution_mock:
+            execution_mock.return_value = _query_result(key, expected_result)
             self.assertEqual(execution_mock.call_count, 0)
             result = self.cache.query_sync(self.query_str)
             self.assertEqual(result, expected_result)
@@ -122,6 +132,19 @@ class TestBQRedis(unittest.TestCase):
             second_result = self.cache.query_sync(self.query_str)
             self.assertEqual(len(second_result), 0)
             self.assertEqual(execution_mock.call_count, 1)
+
+    def test_execution_failure(self):
+        key = self.cache.redis_key_prefix + self.query_hash
+        with self.mock_execute_query_to_bytes() as execution_mock:
+            execution_mock.side_effect = MockException("BigQuery error")
+            self.assertEqual(execution_mock.call_count, 0)
+            with self.assertRaises(MockException):
+                self.cache.query(self.query_str).result(timeout=1)
+            execution_mock.assert_called_once_with(self.query_str, key)
+            self.assertEqual(execution_mock.call_count, 1)
+            with self.assertRaises(MockException):
+                self.cache.query(self.query_str).result(timeout=1)
+            self.assertEqual(execution_mock.call_count, 2)
 
 
 if __name__ == "__main__":

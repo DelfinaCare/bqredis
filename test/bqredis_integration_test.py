@@ -74,6 +74,23 @@ class TestBQRedisIntegration(unittest.TestCase):
         self.assertEqual(second_result, self.expected_result)
         self.assert_in_cache(self.query_hash)
 
+    def test_with_failing_query(self):
+        failing_query = "SELECT nonexistent_col FROM `bigquery-public-data.country_codes.country_codes`"
+        query_hash = hashlib.sha256(failing_query.encode()).hexdigest()
+        failing_result = self.cache.query(failing_query)
+        with self.assertRaises(Exception):
+            failing_result.result()
+        self.assert_not_in_cache(query_hash)
+
+    def test_multiple_queries(self):
+        query_str_2 = "SELECT alpha_2_code FROM `bigquery-public-data.country_codes.country_codes` ORDER BY alpha_3_code ASC LIMIT 3"
+        result1 = self.cache.query(self.query_str)
+        result2 = self.cache.query(query_str_2)
+        self.assertEqual(len(result1.result()), 3)
+        self.assertEqual(result1.result(), self.expected_result)
+        self.assertEqual(len(result2.result()), 3)
+        self.assertNotEqual(result2.result(), self.expected_result)
+
 
 if __name__ == "__main__":
     unittest.main()

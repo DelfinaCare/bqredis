@@ -50,6 +50,10 @@ class TestBQRedis(unittest.TestCase):
                 self.cache._check_redis_cache(self.query_str, key, 10), None
             )
             self.assertEqual(mock_submit.call_count, 0)
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, 0), None
+            )
+            self.assertEqual(mock_submit.call_count, 0)
         ft = concurrent.futures.Future()
         ft.set_result(_query_result(key, records))
         self.cache._cache_put(ft)
@@ -63,6 +67,7 @@ class TestBQRedis(unittest.TestCase):
                 self.cache._check_redis_cache(self.query_str, key, 1), records
             )
             self.assertEqual(mock_submit.call_count, 0)
+
             # Data is close to expiring - only 10 seconds left. Its age is now mocked as 3600 - 10
             self.cache.redis_client.expire(key + ":data", 10)
             self.assertEqual(
@@ -73,6 +78,10 @@ class TestBQRedis(unittest.TestCase):
             # refresh because the main execution will be used to fill the cache.
             self.assertEqual(
                 self.cache._check_redis_cache(self.query_str, key, 1), None
+            )
+            self.assertEqual(mock_submit.call_count, 1)
+            self.assertEqual(
+                self.cache._check_redis_cache(self.query_str, key, 0), None
             )
             self.assertEqual(mock_submit.call_count, 1)
 

@@ -210,16 +210,19 @@ class BQRedis:
         if cached_schema is None or ttl is None:
             return None
         result_age = self.redis_cache_ttl - ttl
-        if max_age is None or (max_age != 0 and result_age < max_age):
-            if result_age > self.redis_background_refresh_ttl:
-                self.executor.submit(self._background_refresh_cache, query, key)
-            logger.debug("Using cached result for query key: %s", key)
-            schema = pyarrow.ipc.read_schema(
-                pyarrow.BufferReader(cached_schema).read_buffer()
-            )
-            if len(cached_data) == 0:
-                return pyarrow.RecordBatch.from_pylist([], schema)
-            return pyarrow.ipc.read_record_batch(cached_data, schema)
+        if max_age is not None and result_age > max_age:
+            return None
+        if max_age == 0:
+            return None
+        if result_age > self.redis_background_refresh_ttl:
+            self.executor.submit(self._background_refresh_cache, query, key)
+        logger.debug("Using cached result for query key: %s", key)
+        schema = pyarrow.ipc.read_schema(
+            pyarrow.BufferReader(cached_schema).read_buffer()
+        )
+        if len(cached_data) == 0:
+            return pyarrow.RecordBatch.from_pylist([], schema)
+        return pyarrow.ipc.read_record_batch(cached_data, schema)
 
     def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.RecordBatch:
         """Execute a bigquery allowing cached results."""

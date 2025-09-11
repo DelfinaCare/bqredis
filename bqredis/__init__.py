@@ -55,7 +55,16 @@ class BQRedis:
             bigquery_storage_client or bq_storage.BigQueryReadClient()
         )
         self.redis_client = redis_client
+        # This executor is used for bigquery, where a lot of actual processing happens.
         self.executor = executor or concurrent.futures.ThreadPoolExecutor()
+        # This executor is used to make it convenient to generate an async interface.
+        # It will have much cheaper processing.
+        max_workers: int | None = getattr(self.executor, "_max_workers")
+        if max_workers is not None:
+            max_workers *= 2
+        self.frontend_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        )
         self.redis_key_prefix = redis_key_prefix
         self.redis_cache_ttl = redis_cache_ttl_sec
         self.redis_background_refresh_ttl = redis_background_refresh_ttl_sec
@@ -251,11 +260,12 @@ class BQRedis:
         self, query: str, max_age: int | None = None
     ) -> concurrent.futures.Future[pyarrow.RecordBatch]:
         """Execute a bigquery allowing cached results as a future."""
-        return self.executor.submit(self.query_sync, query, max_age)
+        return self.frontend_executor.submit(self.query_sync, query, max_age)
 
     def clear_cache_sync(self) -> None:
         """Clear the cache synchronously."""
-        self.inflight_requests.clear()
+        with self.inflight_requests_lock:
+            self.inflight_requests.clear()
         logger.debug("Beginning cache clear")
         key_count = 0
         for key in self.redis_client.scan_iter(self.redis_key_prefix + "*"):
@@ -265,4 +275,4 @@ class BQRedis:
 
     def clear_cache(self) -> concurrent.futures.Future[None]:
         """Clear the cache in the background."""
-        return self.executor.submit(self.clear_cache_sync)
+        return self.frontend_executor.submit(self.clear_cache_sync)

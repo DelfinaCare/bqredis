@@ -78,23 +78,25 @@ class BQRedis:
     ) -> concurrent.futures.Future[_QueryResult]:
         """Only have one instance of a specific query inflight at a time."""
         with self.inflight_requests_lock:
-            # Atomic grab to extract object because values can disappear at any time
-            try:
-                inflight_request = self.inflight_requests[key]
-            except KeyError:
-                logger.debug("Dispatching new inflight request for key: %s", key)
-                new_request = self.executor.submit(self._execute_query, query, key)
-                self.inflight_requests[key] = new_request
-                new_request.add_done_callback(self._cache_put)
-                return new_request
-        logger.debug("Re-used inflight request for key: %s", key)
-        return inflight_request
+            inflight_request = self.inflight_requests.get(key)
+            if inflight_request is not None:
+                logger.debug("Re-used inflight request for key: %s", key)
+                return inflight_request
+            logger.debug("Dispatching new inflight request for key: %s", key)
+            new_request = self.executor.submit(self._execute_query, query, key)
+            self.inflight_requests[key] = new_request
+        new_request.add_done_callback(self._cache_put)
+        return new_request
 
     def _cache_put(
         self, query_result_future: concurrent.futures.Future[_QueryResult]
     ) -> None:
         """Store the serialized schema and data in Redis."""
-        query_result = query_result_future.result()
+        try:
+            query_result = query_result_future.result()
+        except Exception as exc:
+            logger.error("Query failed, not caching result: %s", exc)
+            return
         pipeline = self.redis_client.pipeline()
         pipeline.set(
             query_result.key + ":schema",

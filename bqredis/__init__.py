@@ -1,6 +1,7 @@
 """Implementation of a Redis BigQuery cache."""
 
 import concurrent.futures
+import datetime
 import hashlib
 import io
 import logging
@@ -19,12 +20,20 @@ logger.setLevel(logging.DEBUG)
 
 class _QueryResult:
     key: str
+    query_time: datetime.datetime
     serialized_schema: bytes
     serialized_data: io.BytesIO
     records: typing.Any
 
-    def __init__(self, key: str, serialized_schema: bytes, serialized_data: io.BytesIO):
+    def __init__(
+        self,
+        key: str,
+        query_time: datetime.datetime,
+        serialized_schema: bytes,
+        serialized_data: io.BytesIO,
+    ):
         self.key = key
+        self.query_time = query_time
         self.serialized_schema = serialized_schema
         self.serialized_data = serialized_data
         self.records = None
@@ -122,6 +131,11 @@ class BQRedis:
             query_result.serialized_data.getvalue(),
             ex=self.redis_cache_ttl,
         )
+        pipeline.set(
+            query_result.key + ":query_time",
+            query_result.query_time.isoformat(),
+            ex=self.redis_cache_ttl,
+        )
         pipeline.execute()
         logger.debug("Cached query result for key: %s", query_result.key)
 
@@ -152,6 +166,7 @@ class BQRedis:
 
     # This is its own function for easy mocking.
     def _read_bigquery_bytes(self, query: str, key: str) -> _QueryResult:
+        query_time = datetime.datetime.now(datetime.timezone.utc)
         query_job: bigquery.QueryJob = self.bigquery_client.query(query)
         while not query_job.done(reload=False):
             query_job.reload()
@@ -181,6 +196,7 @@ class BQRedis:
         )
         result = _QueryResult(
             key=key,
+            query_time=query_time,
             serialized_schema=session.arrow_schema.serialized_schema,
             serialized_data=io.BytesIO(),
         )
@@ -220,22 +236,31 @@ class BQRedis:
 
     def _check_redis_cache(
         self, query: str, key: str, max_age: int | None
-    ) -> pyarrow.RecordBatch | None:
+    ) -> tuple[pyarrow.RecordBatch | None, datetime.datetime | None]:
         pipeline = self.redis_client.pipeline()
         pipeline.get(key + ":data")
         pipeline.get(key + ":schema")
-        pipeline.ttl(key + ":data")
+        pipeline.get(key + ":query_time")
         cached_data: bytes | None
         cached_schema: bytes | None
-        ttl: int | None
-        cached_data, cached_schema, ttl = pipeline.execute()
-        if cached_schema is None or ttl is None:
-            return None
-        result_age = self.redis_cache_ttl - ttl
+        cached_query_time_str: bytes | None
+        cached_data, cached_schema, cached_query_time_str = pipeline.execute()
+        if (
+            cached_schema is None
+            or cached_schema is None
+            or cached_query_time_str is None
+        ):
+            return None, None
+        cached_query_time = datetime.datetime.fromisoformat(
+            cached_query_time_str.decode("utf-8")
+        )
+        result_age = (
+            datetime.datetime.now(datetime.timezone.utc) - cached_query_time
+        ).total_seconds()
         if max_age is not None and result_age > max_age:
-            return None
+            return None, None
         if max_age == 0:
-            return None
+            return None, None
         if result_age > self.redis_background_refresh_ttl:
             self.executor.submit(self._background_refresh_cache, query, key)
         logger.debug("Using cached result for query key: %s", key)
@@ -243,24 +268,39 @@ class BQRedis:
             pyarrow.BufferReader(cached_schema).read_buffer()
         )
         if len(cached_data) == 0:
-            return pyarrow.RecordBatch.from_pylist([], schema)
-        return pyarrow.ipc.read_record_batch(cached_data, schema)
+            return pyarrow.RecordBatch.from_pylist([], schema), cached_query_time
+        return pyarrow.ipc.read_record_batch(cached_data, schema), cached_query_time
+
+    def query_sync_with_time(
+        self, query: str, max_age: int | None = None
+    ) -> tuple[pyarrow.RecordBatch, datetime.datetime]:
+        """Execute a bigquery allowing cached results and getting the query time."""
+        query_hash = hashlib.sha256(query.encode()).hexdigest()
+        key = self.redis_key_prefix + query_hash
+        cached_records, cached_query_time = self._check_redis_cache(query, key, max_age)
+        if cached_records is not None and cached_query_time is not None:
+            return self.convert_arrow_to_output_format(
+                cached_records
+            ), cached_query_time
+        logger.debug("Requesting new execution for query key %s", key)
+        result = self._submit_query(query, key).result()
+        return result.records, result.query_time
 
     def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.RecordBatch:
         """Execute a bigquery allowing cached results."""
-        query_hash = hashlib.sha256(query.encode()).hexdigest()
-        key = self.redis_key_prefix + query_hash
-        cached_records = self._check_redis_cache(query, key, max_age)
-        if cached_records is not None:
-            return self.convert_arrow_to_output_format(cached_records)
-        logger.debug("Requesting new execution for query key %s", key)
-        return self._submit_query(query, key).result().records
+        return self.query_sync_with_time(query, max_age)[0]
 
     def query(
         self, query: str, max_age: int | None = None
     ) -> concurrent.futures.Future[pyarrow.RecordBatch]:
         """Execute a bigquery allowing cached results as a future."""
         return self.frontend_executor.submit(self.query_sync, query, max_age)
+
+    def query_with_time(
+        self, query: str, max_age: int | None = None
+    ) -> concurrent.futures.Future[tuple[pyarrow.RecordBatch, datetime.datetime]]:
+        """Execute a bigquery allowing cached results as a future."""
+        return self.frontend_executor.submit(self.query_sync_with_time, query, max_age)
 
     def clear_cache_sync(self) -> None:
         """Clear the cache synchronously."""

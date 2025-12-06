@@ -160,41 +160,34 @@ class TestBQRedis(unittest.TestCase):
         self.executor.shutdown(wait=False)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.cache.executor = self.executor
-        key1 = self.cache.redis_key_prefix + self.query_hash
-        query_str2 = "SELECT baz from qux;"
-        key2 = (
-            self.cache.redis_key_prefix
-            + hashlib.sha256(query_str2.encode()).hexdigest()
-        )
+        query_strs = [f"SELECT foo{i} FROM bar;" for i in range(100)]
+        keys = {
+            self.cache.redis_key_prefix + hashlib.sha256(query.encode()).hexdigest()
+            for query in query_strs
+        }
 
-        expected_result1 = pa.RecordBatch.from_arrays(
+        expected_result = pa.RecordBatch.from_arrays(
             [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
-        )
-        expected_result2 = pa.RecordBatch.from_arrays(
-            [pa.array(["ZA", "ZM", "ZW"])], names=["alpha_2_code"]
         )
         block = threading.Lock()
 
         def _mock_query_executor(query: str, key: str) -> bqredis._QueryResult:
             nonlocal block
             with block:
-                if key == key1:
-                    return _query_result(key1, expected_result1)
-                if key == key2:
-                    return _query_result(key2, expected_result2)
+                if key in keys:
+                    return _query_result(key, expected_result)
                 raise KeyError(key)
 
         with self.mock_execute_query_to_bytes() as execution_mock:
             block.acquire(timeout=1)
             execution_mock.side_effect = _mock_query_executor
             self.assertEqual(execution_mock.call_count, 0)
-            query1 = self.cache.query(self.query_str)
-            query2 = self.cache.query(query_str2)
+            queries = [self.cache.query(query_str) for query_str in query_strs]
             # Allow the functions to proceed without enough threads in the threadpool
             block.release()
-            self.assertEqual(query1.result(timeout=1), expected_result1)
-            self.assertEqual(query2.result(timeout=1), expected_result2)
-            self.assertEqual(execution_mock.call_count, 2)
+            for i, query in enumerate(queries):
+                self.assertEqual(query.result(timeout=1), expected_result)
+            self.assertEqual(execution_mock.call_count, len(query_strs))
 
 
 if __name__ == "__main__":

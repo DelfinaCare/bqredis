@@ -34,11 +34,11 @@ class TestBQRedisIntegration(unittest.TestCase):
         self.assertIsNone(self.redis.get(self.cache.redis_key_prefix + key + ":schema"))
 
     def assert_in_cache(self, key):
-        data = self.redis.get(self.cache.redis_key_prefix + key + ":data")
+        data: bytes = self.redis.get(self.cache.redis_key_prefix + key + ":data")  # type: ignore
         schema = self.redis.get(self.cache.redis_key_prefix + key + ":schema")
         self.assertIsNotNone(data)
         self.assertEqual(schema, self.expected_bin_schema)
-        schema = pa.ipc.read_schema(pa.BufferReader(schema))
+        schema = pa.ipc.read_schema(pa.BufferReader(schema).read_buffer())
         self.assertEqual(pa.ipc.read_record_batch(data, schema), self.expected_result)
 
     def test_execution_end_to_end(self):

@@ -31,8 +31,8 @@ class TestBQRedis(unittest.TestCase):
         self.redis = fakeredis.FakeStrictRedis()
         self.cache = bqredis.BQRedis(
             self.redis,
-            bigquery_client=object(),
-            bigquery_storage_client=object(),
+            bigquery_client=object(),  # type: ignore
+            bigquery_storage_client=object(),  # type: ignore
             executor=self.executor,
         )
         self.query_str = "SELECT foo FROM bar;"

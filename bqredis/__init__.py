@@ -185,6 +185,8 @@ class BQRedis:
                     )
             logger.error("BigQuery job failed for key: %s, error: %s", key, exc)
             raise exc
+        if query_job.destination is None:
+            raise RuntimeError("BigQuery job has no destination table.")
         read_request = bq_storage.types.ReadSession(
             table=query_job.destination.to_bqstorage(),
             data_format=bq_storage.types.DataFormat.ARROW,
@@ -276,7 +278,7 @@ class BQRedis:
         schema = pyarrow.ipc.read_schema(
             pyarrow.BufferReader(cached_schema).read_buffer()
         )
-        if len(cached_data) == 0:
+        if cached_data is None or len(cached_data) == 0:
             return pyarrow.RecordBatch.from_pylist([], schema), cached_query_time
         return pyarrow.ipc.read_record_batch(cached_data, schema), cached_query_time
 

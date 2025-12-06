@@ -108,10 +108,10 @@ class BQRedis:
             logger.debug("Dispatching new inflight request for key: %s", key)
             new_request = self.executor.submit(self._execute_query, query, key)
             self.inflight_requests[key] = new_request
-        new_request.add_done_callback(self._cache_put)
+        new_request.add_done_callback(self._cache_put_callback)
         return new_request
 
-    def _cache_put(
+    def _cache_put_callback(
         self, query_result_future: concurrent.futures.Future[_QueryResult]
     ) -> None:
         """Store the serialized schema and data in Redis."""
@@ -120,6 +120,9 @@ class BQRedis:
         except Exception as exc:
             logger.error("Query failed, not caching result: %s", exc)
             return
+        self._cache_put(query_result)
+
+    def _cache_put(self, query_result: _QueryResult) -> None:
         pipeline = self.redis_client.pipeline()
         pipeline.set(
             query_result.key + ":schema",
@@ -222,11 +225,17 @@ class BQRedis:
             logger.info("Background refresh already in progress for query key %s", key)
             return
         logger.debug("Background refreshing cache for query key %s", key)
-        submission = self._submit_query(query, key)
         self.redis_client.set(
             key + ":background_refresh", "1", ex=self.redis_background_refresh_ttl
         )
-        submission.result()  # Wait for the query to complete before the ref to it expires.
+        try:
+            result = self._execute_query(query, key)
+        except Exception as exc:
+            logger.error("Background refresh for query key %s failed: %s", key, exc)
+        else:
+            self._cache_put(result)
+        finally:
+            self.redis_client.delete(key + ":background_refresh")
 
     def submit_background_refresh(self, query: str) -> concurrent.futures.Future[None]:
         """Submit a background task to refresh the cache for a given query."""

@@ -69,7 +69,7 @@ class TestBQRedis(unittest.TestCase):
             self.assertEqual(mock_submit.call_count, 0)
         ft = concurrent.futures.Future()
         ft.set_result(mock_result)
-        self.cache._cache_put(ft)
+        self.cache._cache_put_callback(ft)
         with unittest.mock.patch.object(self.cache.executor, "submit") as mock_submit:
             # A fresh result should get returned, with no cache refresh
             self.assertEqual(

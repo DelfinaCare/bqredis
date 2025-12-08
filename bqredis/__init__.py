@@ -151,9 +151,11 @@ class BQRedis:
         # duplication which could easily saturate all of our worker threads.
         self.inflight_requests.pop(key, None)
 
-    def _execute_query(self, query: str, key: str) -> _QueryResult:
+    def _execute_query(
+        self, query: str, key: str, background: bool = False
+    ) -> _QueryResult:
         try:
-            result = self._read_bigquery_bytes(query, key)
+            result = self._read_bigquery_bytes(query, key, background)
         finally:
             self._mark_inflight_completed(key)
         schema = pyarrow.ipc.read_schema(
@@ -168,9 +170,18 @@ class BQRedis:
         return result
 
     # This is its own function for easy mocking.
-    def _read_bigquery_bytes(self, query: str, key: str) -> _QueryResult:
+    def _read_bigquery_bytes(
+        self, query: str, key: str, background: bool
+    ) -> _QueryResult:
         query_time = datetime.datetime.now(datetime.timezone.utc)
-        query_job: bigquery.QueryJob = self.bigquery_client.query(query)
+        query_config = (
+            self.bigquery_client.default_query_job_config or bigquery.QueryJobConfig()
+        )
+        if background:
+            query_config.priority = bigquery.QueryPriority.BATCH
+        query_job: bigquery.QueryJob = self.bigquery_client.query(
+            query, job_config=query_config
+        )
         while not query_job.done(reload=False):
             query_job.reload()
         self._mark_inflight_completed(key)
@@ -231,7 +242,7 @@ class BQRedis:
             key + ":background_refresh", "1", ex=self.redis_background_refresh_ttl
         )
         try:
-            result = self._execute_query(query, key)
+            result = self._execute_query(query, key, background=True)
         except Exception as exc:
             logger.error("Background refresh for query key %s failed: %s", key, exc)
         else:

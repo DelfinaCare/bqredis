@@ -118,7 +118,7 @@ class TestBQRedis(unittest.TestCase):
             self.assertEqual(len(result), 2)
             self.assertEqual(result[0], expected_result)
             self.assertEqual(result[1], execution_mock.return_value.query_time)
-            execution_mock.assert_called_once_with(self.query_str, key)
+            execution_mock.assert_called_once_with(self.query_str, key, False)
             self.assertEqual(execution_mock.call_count, 1)
             second_result = self.cache.query_sync(self.query_str)
             self.assertEqual(second_result, expected_result)
@@ -137,7 +137,7 @@ class TestBQRedis(unittest.TestCase):
             self.assertEqual(execution_mock.call_count, 0)
             result = self.cache.query_sync(self.query_str)
             self.assertEqual(len(result), 0)
-            execution_mock.assert_called_once_with(self.query_str, key)
+            execution_mock.assert_called_once_with(self.query_str, key, False)
             self.assertEqual(execution_mock.call_count, 1)
             second_result = self.cache.query_sync(self.query_str)
             self.assertEqual(len(second_result), 0)
@@ -150,7 +150,7 @@ class TestBQRedis(unittest.TestCase):
             self.assertEqual(execution_mock.call_count, 0)
             with self.assertRaises(MockException):
                 self.cache.query(self.query_str).result(timeout=1)
-            execution_mock.assert_called_once_with(self.query_str, key)
+            execution_mock.assert_called_once_with(self.query_str, key, False)
             self.assertEqual(execution_mock.call_count, 1)
             with self.assertRaises(MockException):
                 self.cache.query(self.query_str).result(timeout=1)
@@ -171,7 +171,9 @@ class TestBQRedis(unittest.TestCase):
         )
         block = threading.Lock()
 
-        def _mock_query_executor(query: str, key: str) -> bqredis._QueryResult:
+        def _mock_query_executor(
+            query: str, key: str, background: bool
+        ) -> bqredis._QueryResult:
             nonlocal block
             with block:
                 if key in keys:

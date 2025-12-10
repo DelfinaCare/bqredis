@@ -39,6 +39,7 @@ class TestBQRedis(unittest.TestCase):
         self.query_hash = hashlib.sha256(self.query_str.encode()).hexdigest()
 
     def tearDown(self):
+        self.assertEqual(len(self.cache.inflight_requests), 0)
         self.executor.shutdown(wait=False, cancel_futures=True)
         return super().tearDown()
 

@@ -26,6 +26,7 @@ class TestBQRedisIntegration(unittest.TestCase):
         self.query_hash = hashlib.sha256(self.query_str.encode()).hexdigest()
 
     def tearDown(self):
+        self.assertEqual(len(self.cache.inflight_requests), 0)
         self.cache.clear_cache_sync()
         return super().tearDown()
 

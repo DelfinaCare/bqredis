@@ -251,7 +251,7 @@ class BQRedis:
 
     def _check_redis_cache(
         self, query: str, key: str, max_age: int | None
-    ) -> tuple[pyarrow.RecordBatch | None, datetime.datetime | None]:
+    ) -> tuple[pyarrow.Table | pyarrow.RecordBatch | None, datetime.datetime | None]:
         pipeline = self.redis_client.pipeline()
         pipeline.get(key + ":data")
         pipeline.get(key + ":schema")
@@ -283,12 +283,18 @@ class BQRedis:
             pyarrow.BufferReader(cached_schema).read_buffer()
         )
         if cached_data is None or len(cached_data) == 0:
-            return pyarrow.RecordBatch.from_pylist([], schema), cached_query_time
-        return pyarrow.ipc.read_record_batch(cached_data, schema), cached_query_time
+            return pyarrow.table({}, schema=schema), cached_query_time
+
+        # If reading data from a complete IPC stream, need to use ipc.open_stream
+        # instead of ipc.read_record_batch as per the Arrow documentation:
+        # https://arrow.apache.org/docs/python/generated/pyarrow.ipc.read_record_batch.html
+        
+        reader = pyarrow.ipc.open_stream(pyarrow.BufferReader(cached_data))
+        return reader.read_all(), cached_query_time
 
     def query_sync_with_time(
         self, query: str, max_age: int | None = None
-    ) -> tuple[pyarrow.RecordBatch, datetime.datetime]:
+    ) -> tuple[pyarrow.Table | pyarrow.RecordBatch, datetime.datetime]:
         """Execute a bigquery allowing cached results and getting the query time."""
         query_hash = hashlib.sha256(query.encode()).hexdigest()
         key = self.redis_key_prefix + query_hash
@@ -301,19 +307,19 @@ class BQRedis:
         result = self._submit_query(query, key).result()
         return result.records, result.query_time
 
-    def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.RecordBatch:
+    def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.Table | pyarrow.RecordBatch:
         """Execute a bigquery allowing cached results."""
         return self.query_sync_with_time(query, max_age)[0]
 
     def query(
         self, query: str, max_age: int | None = None
-    ) -> concurrent.futures.Future[pyarrow.RecordBatch]:
+    ) -> concurrent.futures.Future[pyarrow.Table | pyarrow.RecordBatch]:
         """Execute a bigquery allowing cached results as a future."""
         return self.frontend_executor.submit(self.query_sync, query, max_age)
 
     def query_with_time(
         self, query: str, max_age: int | None = None
-    ) -> concurrent.futures.Future[tuple[pyarrow.RecordBatch, datetime.datetime]]:
+    ) -> concurrent.futures.Future[tuple[pyarrow.Table | pyarrow.RecordBatch, datetime.datetime]]:
         """Execute a bigquery allowing cached results as a future."""
         return self.frontend_executor.submit(self.query_sync_with_time, query, max_age)
 

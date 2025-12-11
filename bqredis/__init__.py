@@ -288,7 +288,7 @@ class BQRedis:
         # If reading data from a complete IPC stream, need to use ipc.open_stream
         # instead of ipc.read_record_batch as per the Arrow documentation:
         # https://arrow.apache.org/docs/python/generated/pyarrow.ipc.read_record_batch.html
-        
+
         reader = pyarrow.ipc.open_stream(pyarrow.BufferReader(cached_data))
         return reader.read_all(), cached_query_time
 
@@ -307,7 +307,9 @@ class BQRedis:
         result = self._submit_query(query, key).result()
         return result.records, result.query_time
 
-    def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.Table | pyarrow.RecordBatch:
+    def query_sync(
+        self, query: str, max_age: int | None = None
+    ) -> pyarrow.Table | pyarrow.RecordBatch:
         """Execute a bigquery allowing cached results."""
         return self.query_sync_with_time(query, max_age)[0]
 
@@ -319,7 +321,9 @@ class BQRedis:
 
     def query_with_time(
         self, query: str, max_age: int | None = None
-    ) -> concurrent.futures.Future[tuple[pyarrow.Table | pyarrow.RecordBatch, datetime.datetime]]:
+    ) -> concurrent.futures.Future[
+        tuple[pyarrow.Table | pyarrow.RecordBatch, datetime.datetime]
+    ]:
         """Execute a bigquery allowing cached results as a future."""
         return self.frontend_executor.submit(self.query_sync_with_time, query, max_age)
 

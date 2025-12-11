@@ -59,7 +59,9 @@ class BQRedis:
         redis_background_refresh_ttl_sec: int = 300,  # 5 minutes
     ):
         self.bigquery_client = bigquery_client or bigquery.Client()
-        self.bigquery_storage_client = bigquery_storage_client or bq_storage.BigQueryReadClient()
+        self.bigquery_storage_client = (
+            bigquery_storage_client or bq_storage.BigQueryReadClient()
+        )
         self.redis_client = redis_client
         # This executor is used for bigquery, where a lot of actual processing happens.
         self.executor = executor or concurrent.futures.ThreadPoolExecutor()
@@ -69,12 +71,12 @@ class BQRedis:
         if max_workers is not None:
             max_workers *= 2
         self.frontend_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers)
+            max_workers=max_workers
+        )
         self.redis_key_prefix = redis_key_prefix
         self.redis_cache_ttl = redis_cache_ttl_sec
         self.redis_background_refresh_ttl = redis_background_refresh_ttl_sec
-        self.inflight_requests: dict[str,
-                                     concurrent.futures.Future[_QueryResult]] = {}
+        self.inflight_requests: dict[str, concurrent.futures.Future[_QueryResult]] = {}
         # This lock exists so we can avoid launching multiple inflight requests for the same
         # query while another parallel request is actively queuing. Because this is a weakref
         # dictionary, the lock does not help protect against deletions, so accessing values
@@ -82,14 +84,18 @@ class BQRedis:
         # instead of first checking for existence and then accessing.
         self.inflight_requests_lock = threading.Lock()
 
-    def convert_arrow_to_output_format(self, records: pyarrow.RecordBatch) -> typing.Any:
+    def convert_arrow_to_output_format(
+        self, records: pyarrow.RecordBatch
+    ) -> typing.Any:
         """Convert the pyarrow RecordBatch to the desired output format."""
         # This method should be overridden in subclasses to convert
         # the RecordBatch to the desired output format.
         # The base implementation just returns the RecordBatch itself.
         return records
 
-    def _submit_query(self, query: str, key: str) -> concurrent.futures.Future[_QueryResult]:
+    def _submit_query(
+        self, query: str, key: str
+    ) -> concurrent.futures.Future[_QueryResult]:
         """Only have one instance of a specific query inflight at a time."""
         with self.inflight_requests_lock:
             inflight_request = self.inflight_requests.get(key)
@@ -137,7 +143,9 @@ class BQRedis:
         with self.inflight_requests_lock:
             self.inflight_requests.pop(key)
 
-    def _execute_query(self, query: str, key: str, background: bool = False) -> _QueryResult:
+    def _execute_query(
+        self, query: str, key: str, background: bool = False
+    ) -> _QueryResult:
         try:
             result = self._read_bigquery_bytes(query, key, background)
         finally:
@@ -158,26 +166,30 @@ class BQRedis:
 
     # All of the external IO to GCP happens here in one function.
     # This makes it easier to mock out in unit tests.
-    def _read_bigquery_bytes(self, query: str, key: str, background: bool) -> _QueryResult:
+    def _read_bigquery_bytes(
+        self, query: str, key: str, background: bool
+    ) -> _QueryResult:
         query_time = datetime.datetime.now(datetime.timezone.utc)
-        query_config = self.bigquery_client.default_query_job_config or bigquery.QueryJobConfig()
+        query_config = (
+            self.bigquery_client.default_query_job_config or bigquery.QueryJobConfig()
+        )
         if background:
             query_config.priority = bigquery.QueryPriority.BATCH
         query_job: bigquery.QueryJob = self.bigquery_client.query(
-            query, job_config=query_config)
+            query, job_config=query_config
+        )
         while not query_job.done(reload=False):
             query_job.reload()
         if exc := query_job.exception():
             deleted_count = 0
             try:
-                deleted_count = self.redis_client.delete(
-                    key + ":background_refresh")  # type: ignore
+                deleted_count = self.redis_client.delete(key + ":background_refresh")  # type: ignore
             finally:
                 if deleted_count:
                     logger.info(
-                        "Cleared background refresh marker on failure for key: %s", key)
-            logger.error(
-                "BigQuery job failed for key: %s, error: %s", key, exc)
+                        "Cleared background refresh marker on failure for key: %s", key
+                    )
+            logger.error("BigQuery job failed for key: %s, error: %s", key, exc)
             raise exc
         if query_job.destination is None:
             raise RuntimeError("BigQuery job has no destination table.")
@@ -195,8 +207,7 @@ class BQRedis:
         )
 
         arrow_schema = pyarrow.ipc.read_schema(
-            pyarrow.BufferReader(
-                session.arrow_schema.serialized_schema).read_buffer()
+            pyarrow.BufferReader(session.arrow_schema.serialized_schema).read_buffer()
         )
 
         result = _QueryResult(
@@ -206,8 +217,7 @@ class BQRedis:
             serialized_data=io.BytesIO(),
         )
 
-        writer = pyarrow.ipc.new_stream(
-            result.serialized_data, schema=arrow_schema)
+        writer = pyarrow.ipc.new_stream(result.serialized_data, schema=arrow_schema)
         page_count = 0
 
         for stream in session.streams:
@@ -215,7 +225,8 @@ class BQRedis:
             for page in reader:
                 page_count += 1
                 batch = pyarrow.ipc.read_record_batch(
-                    page.arrow_record_batch.serialized_record_batch, schema=arrow_schema,
+                    page.arrow_record_batch.serialized_record_batch,
+                    schema=arrow_schema,
                 )
                 writer.write_batch(batch)
 
@@ -232,8 +243,7 @@ class BQRedis:
 
     def _background_refresh_cache(self, query: str, key: str) -> None:
         if self.redis_client.get(key + ":background_refresh"):
-            logger.info(
-                "Background refresh already in progress for query key %s", key)
+            logger.info("Background refresh already in progress for query key %s", key)
             return
         logger.debug("Background refreshing cache for query key %s", key)
         self.redis_client.set(
@@ -242,8 +252,7 @@ class BQRedis:
         try:
             result = self._execute_query(query, key, background=True)
         except Exception as exc:
-            logger.error(
-                "Background refresh for query key %s failed: %s", key, exc)
+            logger.error("Background refresh for query key %s failed: %s", key, exc)
         else:
             self._cache_put(result)
         finally:
@@ -266,10 +275,15 @@ class BQRedis:
         cached_schema: bytes | None
         cached_query_time_str: bytes | None
         cached_data, cached_schema, cached_query_time_str = pipeline.execute()
-        if cached_schema is None or cached_schema is None or cached_query_time_str is None:
+        if (
+            cached_schema is None
+            or cached_schema is None
+            or cached_query_time_str is None
+        ):
             return None, None
         cached_query_time = datetime.datetime.fromisoformat(
-            cached_query_time_str.decode("utf-8"))
+            cached_query_time_str.decode("utf-8")
+        )
         result_age = (
             datetime.datetime.now(datetime.timezone.utc) - cached_query_time
         ).total_seconds()
@@ -281,7 +295,8 @@ class BQRedis:
             self.executor.submit(self._background_refresh_cache, query, key)
         logger.debug("Using cached result for query key: %s", key)
         schema = pyarrow.ipc.read_schema(
-            pyarrow.BufferReader(cached_schema).read_buffer())
+            pyarrow.BufferReader(cached_schema).read_buffer()
+        )
         if cached_data is None or len(cached_data) == 0:
             return pyarrow.table({}, schema=schema), cached_query_time
 
@@ -299,10 +314,11 @@ class BQRedis:
         """Execute a bigquery allowing cached results and getting the query time."""
         query_hash = hashlib.sha256(query.encode()).hexdigest()
         key = self.redis_key_prefix + query_hash
-        cached_records, cached_query_time = self._check_redis_cache(
-            query, key, max_age)
+        cached_records, cached_query_time = self._check_redis_cache(query, key, max_age)
         if cached_records is not None and cached_query_time is not None:
-            return self.convert_arrow_to_output_format(cached_records), cached_query_time
+            return self.convert_arrow_to_output_format(
+                cached_records
+            ), cached_query_time
         logger.debug("Requesting new execution for query key %s", key)
         result = self._submit_query(query, key).result()
         return result.records, result.query_time
@@ -321,7 +337,9 @@ class BQRedis:
 
     def query_with_time(
         self, query: str, max_age: int | None = None
-    ) -> concurrent.futures.Future[tuple[pyarrow.Table | pyarrow.RecordBatch, datetime.datetime]]:
+    ) -> concurrent.futures.Future[
+        tuple[pyarrow.Table | pyarrow.RecordBatch, datetime.datetime]
+    ]:
         """Execute a bigquery allowing cached results as a future."""
         return self.frontend_executor.submit(self.query_sync_with_time, query, max_age)
 

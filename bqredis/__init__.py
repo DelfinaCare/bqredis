@@ -7,7 +7,6 @@ import io
 import logging
 import threading
 import typing
-import weakref
 
 import pyarrow.ipc
 import redis
@@ -77,9 +76,7 @@ class BQRedis:
         self.redis_key_prefix = redis_key_prefix
         self.redis_cache_ttl = redis_cache_ttl_sec
         self.redis_background_refresh_ttl = redis_background_refresh_ttl_sec
-        self.inflight_requests: weakref.WeakValueDictionary[
-            str, concurrent.futures.Future[_QueryResult]
-        ] = weakref.WeakValueDictionary()
+        self.inflight_requests: dict[str, concurrent.futures.Future[_QueryResult]] = {}
         # This lock exists so we can avoid launching multiple inflight requests for the same
         # query while another parallel request is actively queuing. Because this is a weakref
         # dictionary, the lock does not help protect against deletions, so accessing values
@@ -143,13 +140,8 @@ class BQRedis:
         logger.debug("Cached query result for key: %s", query_result.key)
 
     def _mark_inflight_completed(self, key: str):
-        # WHAT ARE YOU DOING? YOU ARE MODIFYING THE DICT WITHOUT THE LOCK????
-        # Whoa there - you are right that this is strange - but let me clarify.
-        # This is a weakref dictionary, so entries can already be garbage
-        # collected. We really need the lock to make sure only one thread
-        # at a time tries to create a new inflight request to prevent
-        # duplication which could easily saturate all of our worker threads.
-        self.inflight_requests.pop(key, None)
+        with self.inflight_requests_lock:
+            self.inflight_requests.pop(key)
 
     def _execute_query(
         self, query: str, key: str, background: bool = False
@@ -157,7 +149,8 @@ class BQRedis:
         try:
             result = self._read_bigquery_bytes(query, key, background)
         finally:
-            self._mark_inflight_completed(key)
+            if not background:
+                self._mark_inflight_completed(key)
         schema = pyarrow.ipc.read_schema(
             pyarrow.BufferReader(result.serialized_schema).read_buffer()
         )
@@ -169,7 +162,8 @@ class BQRedis:
         result.records = self.convert_arrow_to_output_format(records)
         return result
 
-    # This is its own function for easy mocking.
+    # All of the external IO to GCP happens here in one function.
+    # This makes it easier to mock out in unit tests.
     def _read_bigquery_bytes(
         self, query: str, key: str, background: bool
     ) -> _QueryResult:
@@ -184,7 +178,6 @@ class BQRedis:
         )
         while not query_job.done(reload=False):
             query_job.reload()
-        self._mark_inflight_completed(key)
         if exc := query_job.exception():
             deleted_count = 0
             try:

@@ -76,7 +76,8 @@ class BQRedis:
         self.redis_key_prefix = redis_key_prefix
         self.redis_cache_ttl = redis_cache_ttl_sec
         self.redis_background_refresh_ttl = redis_background_refresh_ttl_sec
-        self.inflight_requests: dict[str, concurrent.futures.Future[_QueryResult]] = {}
+        self.inflight_requests: dict[str,
+                                     concurrent.futures.Future[_QueryResult]] = {}
         # This lock exists so we can avoid launching multiple inflight requests for the same
         # query while another parallel request is actively queuing. Because this is a weakref
         # dictionary, the lock does not help protect against deletions, so accessing values
@@ -181,13 +182,15 @@ class BQRedis:
         if exc := query_job.exception():
             deleted_count = 0
             try:
-                deleted_count = self.redis_client.delete(key + ":background_refresh")  # type: ignore
+                deleted_count = self.redis_client.delete(
+                    key + ":background_refresh")  # type: ignore
             finally:
                 if deleted_count:
                     logger.info(
                         "Cleared background refresh marker on failure for key: %s", key
                     )
-            logger.error("BigQuery job failed for key: %s, error: %s", key, exc)
+            logger.error(
+                "BigQuery job failed for key: %s, error: %s", key, exc)
             raise exc
         if query_job.destination is None:
             raise RuntimeError("BigQuery job has no destination table.")
@@ -228,7 +231,8 @@ class BQRedis:
 
     def _background_refresh_cache(self, query: str, key: str) -> None:
         if self.redis_client.get(key + ":background_refresh"):
-            logger.info("Background refresh already in progress for query key %s", key)
+            logger.info(
+                "Background refresh already in progress for query key %s", key)
             return
         logger.debug("Background refreshing cache for query key %s", key)
         self.redis_client.set(
@@ -237,7 +241,8 @@ class BQRedis:
         try:
             result = self._execute_query(query, key, background=True)
         except Exception as exc:
-            logger.error("Background refresh for query key %s failed: %s", key, exc)
+            logger.error(
+                "Background refresh for query key %s failed: %s", key, exc)
         else:
             self._cache_put(result)
         finally:
@@ -285,11 +290,13 @@ class BQRedis:
         if cached_data is None or len(cached_data) == 0:
             return pyarrow.table({}, schema=schema), cached_query_time
 
+        # Concatenate schema + data to form a complete IPC stream
+        combined_buffer = cached_schema + cached_data
+
         # If reading data from a complete IPC stream, need to use ipc.open_stream
         # instead of ipc.read_record_batch as per the Arrow documentation:
         # https://arrow.apache.org/docs/python/generated/pyarrow.ipc.read_record_batch.html
-
-        reader = pyarrow.ipc.open_stream(pyarrow.BufferReader(cached_data))
+        reader = pyarrow.ipc.open_stream(pyarrow.BufferReader(combined_buffer))
         return reader.read_all(), cached_query_time
 
     def query_sync_with_time(
@@ -298,7 +305,8 @@ class BQRedis:
         """Execute a bigquery allowing cached results and getting the query time."""
         query_hash = hashlib.sha256(query.encode()).hexdigest()
         key = self.redis_key_prefix + query_hash
-        cached_records, cached_query_time = self._check_redis_cache(query, key, max_age)
+        cached_records, cached_query_time = self._check_redis_cache(
+            query, key, max_age)
         if cached_records is not None and cached_query_time is not None:
             return self.convert_arrow_to_output_format(
                 cached_records

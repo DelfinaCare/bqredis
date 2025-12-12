@@ -11,17 +11,28 @@ import pyarrow as pa
 import bqredis
 
 
-def _query_result(key: str, result: pa.RecordBatch) -> bqredis._QueryResult:
+def _query_result(key: str, *result: pa.RecordBatch) -> bqredis._QueryResult:
+    data = b"".join(r.serialize().to_pybytes() for r in result)
     return bqredis._QueryResult(
         key=key,
         query_time=datetime.datetime.now(datetime.timezone.utc),
-        serialized_schema=result.schema.serialize().to_pybytes(),
-        serialized_data=io.BytesIO(result.serialize().to_pybytes()),
+        serialized_schema=result[0].schema.serialize().to_pybytes(),
+        serialized_data=io.BytesIO(data),
     )
 
 
 class MockException(Exception):
     pass
+
+
+class FakeBigqueryClient:
+    default_query_job_config = None
+
+    def __init__(self, testcase: unittest.TestCase):
+        self.test = testcase
+
+    def query(self, *args, **kwargs):
+        self.test.fail("Failed to mock call to bigquery")
 
 
 class TestBQRedis(unittest.TestCase):
@@ -31,7 +42,7 @@ class TestBQRedis(unittest.TestCase):
         self.redis = fakeredis.FakeStrictRedis()
         self.cache = bqredis.BQRedis(
             self.redis,
-            bigquery_client=object(),  # type: ignore
+            bigquery_client=FakeBigqueryClient(self),  # type: ignore
             bigquery_storage_client=object(),  # type: ignore
             executor=self.executor,
         )
@@ -75,12 +86,12 @@ class TestBQRedis(unittest.TestCase):
             # A fresh result should get returned, with no cache refresh
             self.assertEqual(
                 self.cache._check_redis_cache(self.query_str, key, None),
-                (records, mock_result.query_time),
+                (pa.Table.from_batches([records]), mock_result.query_time),
             )
             self.assertEqual(mock_submit.call_count, 0)
             self.assertEqual(
                 self.cache._check_redis_cache(self.query_str, key, 1),
-                (records, mock_result.query_time),
+                (pa.Table.from_batches([records]), mock_result.query_time),
             )
             self.assertEqual(mock_submit.call_count, 0)
 
@@ -93,7 +104,7 @@ class TestBQRedis(unittest.TestCase):
             )
             self.assertEqual(
                 self.cache._check_redis_cache(self.query_str, key, None),
-                (records, about_to_expire),
+                (pa.Table.from_batches([records]), about_to_expire),
             )
             self.assertEqual(mock_submit.call_count, 1)
             # Requesting a fresh result does not find anything, and does not schedule a background
@@ -107,6 +118,23 @@ class TestBQRedis(unittest.TestCase):
             )
             self.assertEqual(mock_submit.call_count, 1)
 
+    def test_multiple_streams(self):
+        key = self.cache.redis_key_prefix + self.query_hash
+        records = pa.RecordBatch.from_arrays(
+            [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
+        )
+        mock_result = _query_result(key, records, records)
+        with unittest.mock.patch.object(
+            self.cache, "_read_bigquery_bytes", return_value=mock_result
+        ) as execution_mock:
+            self.assertEqual(execution_mock.call_count, 0)
+            result = self.cache.query_sync(self.query_str)
+            self.assertEqual(execution_mock.call_count, 1)
+            self.assertEqual(len(result), 6)
+            second_result = self.cache.query_sync(self.query_str)
+            self.assertEqual(execution_mock.call_count, 1)
+            self.assertEqual(len(second_result), 6)
+
     def test_execution_called_only_once_with_cache(self):
         key = self.cache.redis_key_prefix + self.query_hash
         expected_result = pa.RecordBatch.from_arrays(
@@ -117,12 +145,12 @@ class TestBQRedis(unittest.TestCase):
             self.assertEqual(execution_mock.call_count, 0)
             result = self.cache.query_sync_with_time(self.query_str)
             self.assertEqual(len(result), 2)
-            self.assertEqual(result[0], expected_result)
+            self.assertEqual(result[0], pa.Table.from_batches([expected_result]))
             self.assertEqual(result[1], execution_mock.return_value.query_time)
             execution_mock.assert_called_once_with(self.query_str, key, False)
             self.assertEqual(execution_mock.call_count, 1)
             second_result = self.cache.query_sync(self.query_str)
-            self.assertEqual(second_result, expected_result)
+            self.assertEqual(second_result, pa.Table.from_batches([expected_result]))
             self.assertEqual(execution_mock.call_count, 1)
 
     def test_execution_called_only_once_with_cache_empty_result(self):
@@ -189,7 +217,9 @@ class TestBQRedis(unittest.TestCase):
             # Allow the functions to proceed without enough threads in the threadpool
             block.release()
             for i, query in enumerate(queries):
-                self.assertEqual(query.result(timeout=1), expected_result)
+                self.assertEqual(
+                    query.result(timeout=1), pa.Table.from_batches([expected_result])
+                )
             self.assertEqual(execution_mock.call_count, len(query_strs))
 
 

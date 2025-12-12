@@ -38,6 +38,35 @@ class _QueryResult:
         self.records = None
 
 
+def _read_pyarrow_table(
+    serialized_schema: bytes, serialized_data: bytes | io.BytesIO | None
+) -> pyarrow.Table:
+    # TODO: Stop copying data!
+    schema = pyarrow.ipc.read_schema(
+        pyarrow.BufferReader(serialized_schema).read_buffer()
+    )
+    if serialized_data is None:
+        return pyarrow.Table.from_pylist([], schema)
+    if isinstance(serialized_data, bytes) and len(serialized_data) == 0:
+        return pyarrow.Table.from_pylist([], schema)
+    if (
+        isinstance(serialized_data, io.BytesIO)
+        and serialized_data.getbuffer().nbytes == 0
+    ):
+        return pyarrow.Table.from_pylist([], schema)
+    all_data = io.BytesIO()
+    all_data.write(serialized_schema)
+    if isinstance(serialized_data, io.BytesIO):
+        all_data.write(serialized_data.getbuffer())
+    else:
+        all_data.write(serialized_data)
+
+    with pyarrow.ipc.open_stream(
+        pyarrow.BufferReader(all_data.getbuffer()).read_buffer()
+    ) as reader:
+        return reader.read_all()
+
+
 class BQRedis:
     """A class to cache BigQuery results in Redis.
 
@@ -84,9 +113,7 @@ class BQRedis:
         # instead of first checking for existence and then accessing.
         self.inflight_requests_lock = threading.Lock()
 
-    def convert_arrow_to_output_format(
-        self, records: pyarrow.RecordBatch
-    ) -> typing.Any:
+    def convert_arrow_to_output_format(self, records: pyarrow.Table) -> typing.Any:
         """Convert the pyarrow RecordBatch to the desired output format."""
         # This method should be overridden in subclasses to convert
         # the RecordBatch to the desired output format.
@@ -151,14 +178,7 @@ class BQRedis:
         finally:
             if not background:
                 self._mark_inflight_completed(key)
-        schema = pyarrow.ipc.read_schema(
-            pyarrow.BufferReader(result.serialized_schema).read_buffer()
-        )
-        buffer = result.serialized_data.getbuffer()
-        if buffer.nbytes == 0:
-            records = pyarrow.RecordBatch.from_pylist([], schema)
-        else:
-            records = pyarrow.ipc.read_record_batch(buffer, schema)
+        records = _read_pyarrow_table(result.serialized_schema, result.serialized_data)
         result.records = self.convert_arrow_to_output_format(records)
         return result
 
@@ -251,7 +271,7 @@ class BQRedis:
 
     def _check_redis_cache(
         self, query: str, key: str, max_age: int | None
-    ) -> tuple[pyarrow.RecordBatch | None, datetime.datetime | None]:
+    ) -> tuple[pyarrow.Table | None, datetime.datetime | None]:
         pipeline = self.redis_client.pipeline()
         pipeline.get(key + ":data")
         pipeline.get(key + ":schema")
@@ -279,16 +299,11 @@ class BQRedis:
         if result_age > self.redis_background_refresh_ttl:
             self.executor.submit(self._background_refresh_cache, query, key)
         logger.debug("Using cached result for query key: %s", key)
-        schema = pyarrow.ipc.read_schema(
-            pyarrow.BufferReader(cached_schema).read_buffer()
-        )
-        if cached_data is None or len(cached_data) == 0:
-            return pyarrow.RecordBatch.from_pylist([], schema), cached_query_time
-        return pyarrow.ipc.read_record_batch(cached_data, schema), cached_query_time
+        return _read_pyarrow_table(cached_schema, cached_data), cached_query_time
 
     def query_sync_with_time(
         self, query: str, max_age: int | None = None
-    ) -> tuple[pyarrow.RecordBatch, datetime.datetime]:
+    ) -> tuple[pyarrow.Table, datetime.datetime]:
         """Execute a bigquery allowing cached results and getting the query time."""
         query_hash = hashlib.sha256(query.encode()).hexdigest()
         key = self.redis_key_prefix + query_hash
@@ -301,19 +316,19 @@ class BQRedis:
         result = self._submit_query(query, key).result()
         return result.records, result.query_time
 
-    def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.RecordBatch:
+    def query_sync(self, query: str, max_age: int | None = None) -> pyarrow.Table:
         """Execute a bigquery allowing cached results."""
         return self.query_sync_with_time(query, max_age)[0]
 
     def query(
         self, query: str, max_age: int | None = None
-    ) -> concurrent.futures.Future[pyarrow.RecordBatch]:
+    ) -> concurrent.futures.Future[pyarrow.Table]:
         """Execute a bigquery allowing cached results as a future."""
         return self.frontend_executor.submit(self.query_sync, query, max_age)
 
     def query_with_time(
         self, query: str, max_age: int | None = None
-    ) -> concurrent.futures.Future[tuple[pyarrow.RecordBatch, datetime.datetime]]:
+    ) -> concurrent.futures.Future[tuple[pyarrow.Table, datetime.datetime]]:
         """Execute a bigquery allowing cached results as a future."""
         return self.frontend_executor.submit(self.query_sync_with_time, query, max_age)
 

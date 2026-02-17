@@ -28,7 +28,7 @@ promise.result()
 ```
 
 ## Return type
-By default, this library will parse results as a `pyarrow.RecordBatch`. To
+By default, this library will parse results as a `pyarrow.Table`. To
 instead use a different format, override the `convert_arrow_to_output` method.
 For example, to have results as a `polars.DataFrame` do the following:
 
@@ -37,7 +37,7 @@ import polars
 import pyarrow
 
 class BQRedisPolars(bqredis.BQRedis):
-    def convert_arrow_to_output_format(self, records: pyarrow.RecordBatch) -> polars.DataFrame:
+    def convert_arrow_to_output_format(self, records: pyarrow.Table) -> polars.DataFrame:
         return polars.from_arrow(records)
 
 pl_cache = BQRedisPolars(redis_client, redis_cache_ttl_sec=300, redis_background_refresh_ttl_sec=5)

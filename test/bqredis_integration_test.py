@@ -91,12 +91,12 @@ class TestBQRedisIntegration(unittest.TestCase):
             return sorted(table.column("alpha_2_code").to_pylist())
 
         result_default = bqredis.BQRedis(self.redis).query_sync(query_str)
-        result_1_stream = bqredis.BQRedis(
-            self.redis, max_stream_count=1
-        ).query_sync(query_str)
-        result_2_streams = bqredis.BQRedis(
-            self.redis, max_stream_count=2
-        ).query_sync(query_str)
+        result_1_stream = bqredis.BQRedis(self.redis, max_stream_count=1).query_sync(
+            query_str
+        )
+        result_2_streams = bqredis.BQRedis(self.redis, max_stream_count=2).query_sync(
+            query_str
+        )
 
         self.assertEqual(sorted_column(result_default), sorted_column(result_1_stream))
         self.assertEqual(sorted_column(result_default), sorted_column(result_2_streams))

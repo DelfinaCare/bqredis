@@ -15,10 +15,11 @@ class TestBQRedisIntegration(unittest.TestCase):
         self.redis = redis.Redis.from_url("redis://localhost:6379")
         self.cache = bqredis.BQRedis(self.redis)
         self.query_str = "SELECT alpha_2_code FROM `bigquery-public-data.country_codes.country_codes` ORDER BY alpha_3_code DESC LIMIT 3"
-        self.expected_result = pa.RecordBatch.from_arrays(
+        self.expected_record_batch = pa.RecordBatch.from_arrays(
             [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
         )
-        self.expected_bin_schema = self.expected_result.schema.serialize().to_pybytes()
+        self.expected_table = pa.Table.from_batches([self.expected_record_batch])
+        self.expected_bin_schema = self.expected_table.schema.serialize().to_pybytes()
         # The data could be compressed in different ways, so we will not actually
         # compare binary data directly. We will just ensure that something gets
         # stored in redis, and that the data deserialized correctly.
@@ -40,17 +41,19 @@ class TestBQRedisIntegration(unittest.TestCase):
         self.assertIsNotNone(data)
         self.assertEqual(schema, self.expected_bin_schema)
         schema = pa.ipc.read_schema(pa.BufferReader(schema).read_buffer())
-        self.assertEqual(pa.ipc.read_record_batch(data, schema), self.expected_result)
+        self.assertEqual(
+            pa.ipc.read_record_batch(data, schema), self.expected_record_batch
+        )
 
     def test_execution_end_to_end(self):
         self.assert_not_in_cache(self.query_hash)
         first_result = self.cache.query_sync(self.query_str)
         self.assertEqual(len(first_result), 3)
-        self.assertEqual(first_result, self.expected_result)
+        self.assertEqual(first_result, self.expected_table)
         self.assert_in_cache(self.query_hash)
         second_result = self.cache.query_sync(self.query_str)
         self.assertEqual(len(second_result), 3)
-        self.assertEqual(second_result, self.expected_result)
+        self.assertEqual(second_result, self.expected_table)
         self.assert_in_cache(self.query_hash)
 
     def test_execution_end_to_end_empty_result(self):
@@ -72,7 +75,7 @@ class TestBQRedisIntegration(unittest.TestCase):
         self.assert_in_cache(self.query_hash)
         second_result = self.cache.query_sync(self.query_str)
         self.assertEqual(len(second_result), 3)
-        self.assertEqual(second_result, self.expected_result)
+        self.assertEqual(second_result, self.expected_table)
         self.assert_in_cache(self.query_hash)
 
     def test_with_failing_query(self):
@@ -88,9 +91,9 @@ class TestBQRedisIntegration(unittest.TestCase):
         result1 = self.cache.query(self.query_str)
         result2 = self.cache.query(query_str_2)
         self.assertEqual(len(result1.result()), 3)
-        self.assertEqual(result1.result(), self.expected_result)
+        self.assertEqual(result1.result(), self.expected_table)
         self.assertEqual(len(result2.result()), 3)
-        self.assertNotEqual(result2.result(), self.expected_result)
+        self.assertNotEqual(result2.result(), self.expected_table)
 
 
 if __name__ == "__main__":

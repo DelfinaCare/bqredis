@@ -86,6 +86,7 @@ class BQRedis:
         redis_key_prefix: str = "bigquery_cache:",
         redis_cache_ttl_sec: int = 3600,  # 1 hour
         redis_background_refresh_ttl_sec: int = 300,  # 5 minutes
+        max_stream_count: int | None = None,
     ):
         self.bigquery_client = bigquery_client or bigquery.Client()
         self.bigquery_storage_client = (
@@ -105,6 +106,7 @@ class BQRedis:
         self.redis_key_prefix = redis_key_prefix
         self.redis_cache_ttl = redis_cache_ttl_sec
         self.redis_background_refresh_ttl = redis_background_refresh_ttl_sec
+        self.max_stream_count = max_stream_count
         self.inflight_requests: dict[str, concurrent.futures.Future[_QueryResult]] = {}
         # This lock exists so we can avoid launching multiple inflight requests for the same
         # query while another parallel request is actively queuing. Because this is a weakref
@@ -221,7 +223,7 @@ class BQRedis:
         session = self.bigquery_storage_client.create_read_session(
             parent=f"projects/{query_job.destination.project}",
             read_session=read_request,
-            max_stream_count=1,
+            max_stream_count=self.max_stream_count or 0,
         )
         result = _QueryResult(
             key=key,

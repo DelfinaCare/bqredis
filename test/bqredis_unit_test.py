@@ -185,6 +185,21 @@ class TestBQRedis(unittest.TestCase):
                 self.cache.query(self.query_str).result(timeout=1)
             self.assertEqual(execution_mock.call_count, 2)
 
+    def test_max_stream_count_default(self):
+        """Test that max_stream_count defaults to None and passes 0 to create_read_session."""
+        self.assertIsNone(self.cache.max_stream_count)
+
+    def test_max_stream_count_custom(self):
+        """Test that a custom max_stream_count is stored and used."""
+        cache = bqredis.BQRedis(
+            self.redis,
+            bigquery_client=FakeBigqueryClient(self),  # type: ignore
+            bigquery_storage_client=object(),  # type: ignore
+            executor=self.executor,
+            max_stream_count=4,
+        )
+        self.assertEqual(cache.max_stream_count, 4)
+
     def test_executor_exhaustion(self):
         self.executor.shutdown(wait=False)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)

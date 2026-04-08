@@ -83,6 +83,24 @@ class TestBQRedisIntegration(unittest.TestCase):
             failing_result.result()
         self.assert_not_in_cache(query_hash)
 
+    def test_stream_count_consistency(self):
+        """Results from no max_streams, 1 stream, and 2 streams should be the same (order may vary)."""
+        query_str = "SELECT alpha_2_code FROM `bigquery-public-data.country_codes.country_codes`"
+
+        def sorted_column(table: pa.Table) -> list:
+            return sorted(table.column("alpha_2_code").to_pylist())
+
+        result_default = bqredis.BQRedis(self.redis).query_sync(query_str)
+        result_1_stream = bqredis.BQRedis(
+            self.redis, max_stream_count=1
+        ).query_sync(query_str)
+        result_2_streams = bqredis.BQRedis(
+            self.redis, max_stream_count=2
+        ).query_sync(query_str)
+
+        self.assertEqual(sorted_column(result_default), sorted_column(result_1_stream))
+        self.assertEqual(sorted_column(result_default), sorted_column(result_2_streams))
+
     def test_multiple_queries(self):
         query_str_2 = "SELECT alpha_2_code FROM `bigquery-public-data.country_codes.country_codes` ORDER BY alpha_3_code ASC LIMIT 3"
         result1 = self.cache.query(self.query_str)

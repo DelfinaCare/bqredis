@@ -1,22 +1,15 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
-[tool.hatch.build]
-include = ["bqredis/*"]
-
-[tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.version.raw-options]
-local_scheme = "no-local-version"
-
-[tool.hatch.metadata.hooks.vcs.urls]
-source_archive = "https://github.com/DelfinaCare/bqredis/archive/{commit_hash}.zip"
+[tool.maturin]
+python-source = "."
+module-name = "bqredis._bqredis"
+features = ["pyo3/extension-module"]
 
 [project]
 name = "bqredis"
-dynamic = ["version"]
+version = "0.1.0"
 authors = [
   { name="Ali.Ebrahim", email="ali@delfina.com" },
 ]
@@ -31,16 +24,12 @@ classifiers = [
 ]
 
 dependencies = [
-  "redis >= 5.2.1",
   "pyarrow >= 18.1.0",
-  "google-cloud-bigquery >= 3.35.1",
-  "google-cloud-bigquery-storage >= 2.32.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "mypy >=1.11.2",
-  "fakeredis >= 2.30.3",
   "pyarrow-stubs >=20.0.0.20250716",
   "pytest >= 8.4.1"
 ]

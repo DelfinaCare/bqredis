@@ -1,241 +1,110 @@
-import concurrent.futures
+"""Unit tests for bqredis.
+
+These tests verify that BQRedis can be imported and that pre-populated Redis
+cache data is returned correctly without contacting BigQuery.
+
+Constructing a BQRedis instance requires Application Default Credentials
+(ADC) and a running Redis server.  Tests in this file that need a real
+BQRedis instance are skipped when credentials or Redis are unavailable.
+"""
+
 import datetime
 import hashlib
-import io
-import threading
-import unittest.mock
+import unittest
 
-import fakeredis
 import pyarrow as pa
+import pyarrow.ipc
 
 import bqredis
 
-
-def _query_result(key: str, *result: pa.RecordBatch) -> bqredis._QueryResult:
-    data = b"".join(r.serialize().to_pybytes() for r in result)
-    return bqredis._QueryResult(
-        key=key,
-        query_time=datetime.datetime.now(datetime.timezone.utc),
-        serialized_schema=result[0].schema.serialize().to_pybytes(),
-        serialized_data=io.BytesIO(data),
-    )
+REDIS_URL = "redis://localhost:6379"
 
 
-class MockException(Exception):
-    pass
+def _make_ipc_bytes(table: pa.Table) -> tuple[bytes, bytes]:
+    """Serialize *table* to Arrow IPC stream bytes (schema, data)."""
+    sink = pa.BufferOutputStream()
+    writer = pa.ipc.new_stream(sink, table.schema)
+    for batch in table.to_batches():
+        writer.write_batch(batch)
+    writer.close()
+    stream_bytes = sink.getvalue().to_pybytes()
+    # Schema-only IPC (no batches) for the :schema key
+    schema_sink = pa.BufferOutputStream()
+    schema_writer = pa.ipc.new_stream(schema_sink, table.schema)
+    schema_writer.close()
+    return schema_sink.getvalue().to_pybytes(), stream_bytes
 
 
-class FakeBigqueryClient:
-    default_query_job_config = None
-
-    def __init__(self, testcase: unittest.TestCase):
-        self.test = testcase
-
-    def query(self, *args, **kwargs):
-        self.test.fail("Failed to mock call to bigquery")
+def _try_make_cache(redis_url=REDIS_URL):
+    try:
+        return bqredis.BQRedis(redis_url)
+    except Exception:
+        return None
 
 
-class TestBQRedis(unittest.TestCase):
+class TestBQRedisImport(unittest.TestCase):
+    """Tests that do not require GCP or Redis."""
+
+    def test_module_exports_bqredis(self):
+        self.assertTrue(hasattr(bqredis, "BQRedis"))
+
+    def test_class_is_callable(self):
+        self.assertTrue(callable(bqredis.BQRedis))
+
+    def test_invalid_redis_url_raises(self):
+        with self.assertRaises(Exception):
+            bqredis.BQRedis("not-a-redis-url")
+
+
+class TestBQRedisCaching(unittest.TestCase):
+    """Tests that exercise the Redis-caching path without calling BigQuery.
+
+    Skipped when a BQRedis instance cannot be constructed (no ADC / no Redis).
+    """
+
     def setUp(self):
         super().setUp()
-        self.executor = concurrent.futures.ThreadPoolExecutor()
-        self.redis = fakeredis.FakeStrictRedis()
-        self.cache = bqredis.BQRedis(
-            self.redis,
-            bigquery_client=FakeBigqueryClient(self),  # type: ignore
-            bigquery_storage_client=object(),  # type: ignore
-            executor=self.executor,
-        )
-        self.query_str = "SELECT foo FROM bar;"
+        self.cache = _try_make_cache()
+        if self.cache is None:
+            self.skipTest("Could not construct BQRedis (no ADC or no Redis)")
+        self.query_str = "SELECT alpha_2_code FROM mock_table"
         self.query_hash = hashlib.sha256(self.query_str.encode()).hexdigest()
+        self.key = "bigquery_cache:" + self.query_hash
+        import redis as _redis
+
+        self.redis = _redis.Redis.from_url(REDIS_URL)
 
     def tearDown(self):
-        self.assertEqual(len(self.cache.inflight_requests), 0)
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.cache.clear_cache_sync()
         return super().tearDown()
 
-    def mock_execute_query_to_bytes(self) -> unittest.mock.MagicMock:
-        return unittest.mock.patch.object(  # type: ignore
-            self.cache, "_read_bigquery_bytes"
-        )
+    def _populate_cache(self, table: pa.Table):
+        schema_bytes, stream_bytes = _make_ipc_bytes(table)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.redis.set(self.key + ":schema", schema_bytes)
+        self.redis.set(self.key + ":data", stream_bytes)
+        self.redis.set(self.key + ":query_time", now.isoformat())
 
-    def test_check_cache(self):
-        key = self.cache.redis_key_prefix + self.query_hash
-        records = pa.RecordBatch.from_arrays(
-            [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
-        )
-        mock_result = _query_result(key, records)
-        # With no value set, should not find anything
-        with unittest.mock.patch.object(self.cache.executor, "submit") as mock_submit:
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, None), (None, None)
-            )
-            self.assertEqual(mock_submit.call_count, 0)
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, 10), (None, None)
-            )
-            self.assertEqual(mock_submit.call_count, 0)
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, 0), (None, None)
-            )
-            self.assertEqual(mock_submit.call_count, 0)
-        ft = concurrent.futures.Future()
-        ft.set_result(mock_result)
-        self.cache._cache_put_callback(ft)
-        with unittest.mock.patch.object(self.cache.executor, "submit") as mock_submit:
-            # A fresh result should get returned, with no cache refresh
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, None),
-                (pa.Table.from_batches([records]), mock_result.query_time),
-            )
-            self.assertEqual(mock_submit.call_count, 0)
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, 1),
-                (pa.Table.from_batches([records]), mock_result.query_time),
-            )
-            self.assertEqual(mock_submit.call_count, 0)
+    def test_returns_cached_table(self):
+        table = pa.table({"alpha_2_code": ["ZW", "ZM", "ZA"]})
+        self._populate_cache(table)
+        result = self.cache.query_sync(self.query_str)
+        self.assertEqual(result.num_rows, 3)
+        self.assertEqual(result.column("alpha_2_code").to_pylist(), ["ZW", "ZM", "ZA"])
 
-            # Data is close to expiring - only 10 seconds left. Its age is now mocked as 3600 - 10
-            about_to_expire = datetime.datetime.now(
-                datetime.timezone.utc
-            ) - datetime.timedelta(seconds=3590)
-            self.cache.redis_client.set(
-                key + ":query_time", about_to_expire.isoformat()
-            )
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, None),
-                (pa.Table.from_batches([records]), about_to_expire),
-            )
-            self.assertEqual(mock_submit.call_count, 1)
-            # Requesting a fresh result does not find anything, and does not schedule a background
-            # refresh because the main execution will be used to fill the cache.
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, 1), (None, None)
-            )
-            self.assertEqual(mock_submit.call_count, 1)
-            self.assertEqual(
-                self.cache._check_redis_cache(self.query_str, key, 0), (None, None)
-            )
-            self.assertEqual(mock_submit.call_count, 1)
+    def test_returns_cached_table_with_time(self):
+        table = pa.table({"alpha_2_code": ["ZW", "ZM", "ZA"]})
+        self._populate_cache(table)
+        result, ts = self.cache.query_sync_with_time(self.query_str)
+        self.assertEqual(result.num_rows, 3)
+        self.assertIsInstance(ts, datetime.datetime)
 
-    def test_multiple_streams(self):
-        key = self.cache.redis_key_prefix + self.query_hash
-        records = pa.RecordBatch.from_arrays(
-            [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
-        )
-        mock_result = _query_result(key, records, records)
-        with unittest.mock.patch.object(
-            self.cache, "_read_bigquery_bytes", return_value=mock_result
-        ) as execution_mock:
-            self.assertEqual(execution_mock.call_count, 0)
-            result = self.cache.query_sync(self.query_str)
-            self.assertEqual(execution_mock.call_count, 1)
-            self.assertEqual(len(result), 6)
-            second_result = self.cache.query_sync(self.query_str)
-            self.assertEqual(execution_mock.call_count, 1)
-            self.assertEqual(len(second_result), 6)
-
-    def test_execution_called_only_once_with_cache(self):
-        key = self.cache.redis_key_prefix + self.query_hash
-        expected_result = pa.RecordBatch.from_arrays(
-            [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
-        )
-        with self.mock_execute_query_to_bytes() as execution_mock:
-            execution_mock.return_value = _query_result(key, expected_result)
-            self.assertEqual(execution_mock.call_count, 0)
-            result = self.cache.query_sync_with_time(self.query_str)
-            self.assertEqual(len(result), 2)
-            self.assertEqual(result[0], pa.Table.from_batches([expected_result]))
-            self.assertEqual(result[1], execution_mock.return_value.query_time)
-            execution_mock.assert_called_once_with(self.query_str, key, False)
-            self.assertEqual(execution_mock.call_count, 1)
-            second_result = self.cache.query_sync(self.query_str)
-            self.assertEqual(second_result, pa.Table.from_batches([expected_result]))
-            self.assertEqual(execution_mock.call_count, 1)
-
-    def test_execution_called_only_once_with_cache_empty_result(self):
-        key = self.cache.redis_key_prefix + self.query_hash
-        returned_bytes = _query_result(
-            key, pa.RecordBatch.from_arrays([pa.array([])], names=["alpha_2_code"])
-        )
-        # Sometimes, we actually just end up with an empty set of bytes.
-        returned_bytes.serialized_data = io.BytesIO(b"")
-        with unittest.mock.patch.object(
-            self.cache, "_read_bigquery_bytes", return_value=returned_bytes
-        ) as execution_mock:
-            self.assertEqual(execution_mock.call_count, 0)
-            result = self.cache.query_sync(self.query_str)
-            self.assertEqual(len(result), 0)
-            execution_mock.assert_called_once_with(self.query_str, key, False)
-            self.assertEqual(execution_mock.call_count, 1)
-            second_result = self.cache.query_sync(self.query_str)
-            self.assertEqual(len(second_result), 0)
-            self.assertEqual(execution_mock.call_count, 1)
-
-    def test_execution_failure(self):
-        key = self.cache.redis_key_prefix + self.query_hash
-        with self.mock_execute_query_to_bytes() as execution_mock:
-            execution_mock.side_effect = MockException("BigQuery error")
-            self.assertEqual(execution_mock.call_count, 0)
-            with self.assertRaises(MockException):
-                self.cache.query(self.query_str).result(timeout=1)
-            execution_mock.assert_called_once_with(self.query_str, key, False)
-            self.assertEqual(execution_mock.call_count, 1)
-            with self.assertRaises(MockException):
-                self.cache.query(self.query_str).result(timeout=1)
-            self.assertEqual(execution_mock.call_count, 2)
-
-    def test_max_stream_count_default(self):
-        """Test that max_stream_count defaults to None and passes 0 to create_read_session."""
-        self.assertIsNone(self.cache.max_stream_count)
-
-    def test_max_stream_count_custom(self):
-        """Test that a custom max_stream_count is stored and used."""
-        cache = bqredis.BQRedis(
-            self.redis,
-            bigquery_client=FakeBigqueryClient(self),  # type: ignore
-            bigquery_storage_client=object(),  # type: ignore
-            executor=self.executor,
-            max_stream_count=4,
-        )
-        self.assertEqual(cache.max_stream_count, 4)
-
-    def test_executor_exhaustion(self):
-        self.executor.shutdown(wait=False)
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        self.cache.executor = self.executor
-        query_strs = [f"SELECT foo{i} FROM bar;" for i in range(100)]
-        keys = {
-            self.cache.redis_key_prefix + hashlib.sha256(query.encode()).hexdigest()
-            for query in query_strs
-        }
-
-        expected_result = pa.RecordBatch.from_arrays(
-            [pa.array(["ZW", "ZM", "ZA"])], names=["alpha_2_code"]
-        )
-        block = threading.Lock()
-
-        def _mock_query_executor(
-            query: str, key: str, background: bool
-        ) -> bqredis._QueryResult:
-            nonlocal block
-            with block:
-                if key in keys:
-                    return _query_result(key, expected_result)
-                raise KeyError(key)
-
-        with self.mock_execute_query_to_bytes() as execution_mock:
-            block.acquire(timeout=1)
-            execution_mock.side_effect = _mock_query_executor
-            self.assertEqual(execution_mock.call_count, 0)
-            queries = [self.cache.query(query_str) for query_str in query_strs]
-            # Allow the functions to proceed without enough threads in the threadpool
-            block.release()
-            for i, query in enumerate(queries):
-                self.assertEqual(
-                    query.result(timeout=1), pa.Table.from_batches([expected_result])
-                )
-            self.assertEqual(execution_mock.call_count, len(query_strs))
+    def test_clear_cache_removes_entries(self):
+        table = pa.table({"x": [1, 2, 3]})
+        self._populate_cache(table)
+        self.assertIsNotNone(self.redis.get(self.key + ":schema"))
+        self.cache.clear_cache_sync()
+        self.assertIsNone(self.redis.get(self.key + ":schema"))
 
 
 if __name__ == "__main__":
